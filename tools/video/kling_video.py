@@ -83,6 +83,17 @@ class KlingVideo(BaseTool):
                 "enum": ["16:9", "9:16", "1:1"],
                 "default": "16:9",
             },
+            "generate_audio": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Kling's native audio generation. Defaults to False (fal.ai's own "
+                    "API default is True) because OpenMontage narration/music is mixed "
+                    "in separately at compose time -- Kling's native audio would just be "
+                    "discarded, and fal.ai bills audio-on generations at a materially "
+                    "higher per-second rate ($0.126/s vs $0.084/s for v3/standard)."
+                ),
+            },
             "image_url": {"type": "string", "description": "Reference image URL for image_to_video"},
             "output_path": {"type": "string"},
         },
@@ -105,13 +116,34 @@ class KlingVideo(BaseTool):
         return ToolStatus.UNAVAILABLE
 
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
+        # Per-second rates, confirmed against fal.ai's own model pages
+        # (2026-08-29) rather than guessed -- the previous formula used a
+        # flat $0.10-per-5s-block ($0.02/s effective), which undercounted
+        # real billing by ~7x.
+        #
+        # v3/standard: fal.ai's pricing page states $0.084/s (audio off) or
+        # $0.126/s (audio on). This tool defaults generate_audio=False (see
+        # input_schema) since OpenMontage mixes narration/music in separately
+        # at compose time -- Kling's native audio would just be discarded.
+        # v2.1/master: confirmed flat $0.28/s ($1.40 for 5s + $0.28/extra
+        # second); fal's page for this tier does not document a separate
+        # audio-off rate, so it's treated as audio-invariant here.
+        # v2.1/pro: fal's per-model page for this variant 404'd during
+        # verification -- NOT independently confirmed. Estimated by scaling
+        # standard's audio on/off rates by the same ~2x multiplier implied by
+        # master/standard. Re-verify before trusting this tier for a real
+        # budget decision.
         variant = inputs.get("model_variant", "v3/standard")
         duration = int(inputs.get("duration", "5"))
+        generate_audio = bool(inputs.get("generate_audio", False))
+
         if "master" in variant:
-            return 0.30 * (duration / 5)
-        if "pro" in variant:
-            return 0.20 * (duration / 5)
-        return 0.10 * (duration / 5)  # standard
+            rate_per_second = 0.28
+        elif "pro" in variant:
+            rate_per_second = 0.252 if generate_audio else 0.168  # unverified, see above
+        else:
+            rate_per_second = 0.126 if generate_audio else 0.084  # standard, confirmed
+        return round(rate_per_second * duration, 4)
 
     def estimate_runtime(self, inputs: dict[str, Any]) -> float:
         return 60.0  # ~1 minute typical
@@ -140,6 +172,12 @@ class KlingVideo(BaseTool):
             payload["aspect_ratio"] = inputs["aspect_ratio"]
         if operation == "image_to_video" and inputs.get("image_url"):
             payload["image_url"] = inputs["image_url"]
+        # Explicit, not conditional: fal.ai's own API default is True, and
+        # OpenMontage narration/music is mixed in separately at compose time,
+        # so Kling's native audio would just be discarded while still being
+        # billed at the higher audio-on rate. Must always be sent to override
+        # fal's default rather than silently inheriting it.
+        payload["generate_audio"] = bool(inputs.get("generate_audio", False))
 
         headers = {
             "Authorization": f"Key {api_key}",
